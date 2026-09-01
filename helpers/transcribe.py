@@ -1,4 +1,4 @@
-"""Transcribe a video with ElevenLabs Scribe.
+"""Transcribe a video with ElevenLabs Scribe or local Faster-Whisper.
 
 Extracts mono 16kHz audio via ffmpeg, uploads to Scribe with verbatim +
 diarize + audio events + word-level timestamps, writes the full response
@@ -11,6 +11,7 @@ Usage:
     python helpers/transcribe.py <video_path> --edit-dir /custom/edit
     python helpers/transcribe.py <video_path> --language en
     python helpers/transcribe.py <video_path> --num-speakers 2
+    python helpers/transcribe.py <video_path> --local
 """
 
 from __future__ import annotations
@@ -113,6 +114,30 @@ def call_scribe(
     return resp.json()
 
 
+def call_faster_whisper(audio_path: Path, language: str | None, model_name: str) -> dict:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as e:
+        raise RuntimeError(
+            'Faster-Whisper is not installed; run pip install -e ".[local-transcription]"'
+        ) from e
+
+    model = WhisperModel(model_name, device="auto", compute_type="default")
+    segments, _ = model.transcribe(
+        str(audio_path), language=language, word_timestamps=True, vad_filter=True
+    )
+    words = []
+    for segment in segments:
+        for word in segment.words or []:
+            words.append({
+                "type": "word",
+                "text": word.word.strip(),
+                "start": word.start,
+                "end": word.end,
+            })
+    return {"words": words}
+
+
 def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
     """Where a video's transcript lands.
 
@@ -128,11 +153,13 @@ def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
 def transcribe_one(
     video: Path,
     edit_dir: Path,
-    api_key: str,
+    api_key: str | None,
     language: str | None = None,
     num_speakers: int | None = None,
     verbose: bool = True,
     audio_track: int = 0,
+    local: bool = False,
+    model: str = "large-v3-turbo",
 ) -> Path:
     """Transcribe a single video. Returns path to transcript JSON.
 
@@ -174,8 +201,12 @@ def transcribe_one(
 
         size_mb = audio.stat().st_size / (1024 * 1024)
         if verbose:
-            print(f"  uploading {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
-        payload = call_scribe(audio, api_key, language, num_speakers)
+            action = "transcribing" if local else "uploading"
+            print(f"  {action} {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
+        if local:
+            payload = call_faster_whisper(audio, language, model)
+        else:
+            payload = call_scribe(audio, api_key or "", language, num_speakers)
 
     out_path.write_text(json.dumps(payload, indent=2))
     dt = time.time() - t0
@@ -190,7 +221,7 @@ def transcribe_one(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Transcribe a video with ElevenLabs Scribe")
+    ap = argparse.ArgumentParser(description="Transcribe a video with Scribe or Faster-Whisper")
     ap.add_argument("video", type=Path, help="Path to video file")
     ap.add_argument(
         "--edit-dir",
@@ -218,6 +249,16 @@ def main() -> None:
              "and the mic on track 1; without this ffmpeg applies its default audio "
              "stream selection, which picks the track with the most channels.",
     )
+    ap.add_argument(
+        "--local",
+        action="store_true",
+        help="Transcribe locally with Faster-Whisper instead of ElevenLabs Scribe.",
+    )
+    ap.add_argument(
+        "--model",
+        default="large-v3-turbo",
+        help="Faster-Whisper model to use with --local (default: large-v3-turbo).",
+    )
     args = ap.parse_args()
 
     video = args.video.resolve()
@@ -225,7 +266,7 @@ def main() -> None:
         sys.exit(f"video not found: {video}")
 
     edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
-    api_key = load_api_key()
+    api_key = None if args.local else load_api_key()
 
     transcribe_one(
         video=video,
@@ -234,6 +275,8 @@ def main() -> None:
         language=args.language,
         num_speakers=args.num_speakers,
         audio_track=args.audio_track,
+        local=args.local,
+        model=args.model,
     )
 
 
